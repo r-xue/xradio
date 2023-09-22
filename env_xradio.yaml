@@ -1,0 +1,40 @@
+############################################################################
+# $ mamba env create -f env_xradio.yaml
+############################################################################
+
+name: env_xradio
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - conda-ecosystem-user-package-isolation
+  - python=3.10
+  - ipython
+  - pip
+  - astropy
+  - matplotlib
+  - numba
+  - scipy
+  - dask
+  - xarray
+  - zarr
+  - python-casacore
+  - jupyterlab
+  - pytest
+  - pytest-cov
+  - pytest-html
+
+  - jupyterlab
+  - pandoc
+
+  - line_profiler
+  - memory_profiler
+  - future
+
+  - pip:
+      - --index-url https://casa-pip.nrao.edu/repository/pypi-group/simple
+      - casatools == 6.6.0.17
+      - casatasks == 6.6.0.17
+      - casadata
