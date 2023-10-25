@@ -44,11 +44,10 @@ import xarray as xr
 
 
 def add_encoding(xds, compressor, chunks=None):
-    
     if chunks is None:
         chunks = xds.dims
-        
-    chunks = {**dict(xds.dims),**chunks} #Add missing dims if presents.
+
+    chunks = {**dict(xds.dims), **chunks}  # Add missing dims if presents.
 
     encoding = {}
     for da_name in list(xds.data_vars):
@@ -58,6 +57,52 @@ def add_encoding(xds, compressor, chunks=None):
             # print(xds[da_name].encoding)
         else:
             xds[da_name].encoding = {"compressor": compressor}
+
+
+casacore_to_msv4_measure_type = {
+    "quanta": {"type": "quanta", "Ref": None},
+    "direction": {"type": "sky_coord", "Ref": "frame"},
+    "epoch": {"type": "time", "Ref": "scale"},
+    "frequency": {"type": "spectral_coord", "Ref": "frame"},
+    "position": {"type": "earth_location", "Ref": "ellipsoid"},
+    "uvw": {"type": "uvw", "Ref": "frame"},
+}
+
+casacore_to_msv4_ref = {"J2000": "FK5", "ITRF": "GRS80"}
+
+
+def column_description_casacore_to_msv4_measure(
+    casacore_column_description, ref_code=None, time_format="unix"
+):
+    msv4_measure = {}
+    if "MEASINFO" in casacore_column_description["keywords"]:
+        msv4_measure["type"] = casacore_to_msv4_measure_type[
+            casacore_column_description["keywords"]["MEASINFO"]["type"]
+        ]["type"]
+        msv4_measure["units"] = list(casacore_column_description["keywords"]["QuantumUnits"])
+
+        if "TabRefCodes" in casacore_column_description["keywords"]["MEASINFO"]:
+            ref_index = np.where(
+                casacore_column_description["keywords"]["MEASINFO"]["TabRefCodes"]
+                == ref_code
+            )[0][0]
+            casa_ref = casacore_column_description["keywords"]["MEASINFO"][
+                "TabRefTypes"
+            ][ref_index]
+        else:
+            casa_ref = casacore_column_description["keywords"]["MEASINFO"]["Ref"]
+
+        if casa_ref in casacore_to_msv4_ref:
+            casa_ref = casacore_to_msv4_ref[casa_ref]
+        msv4_measure[
+            casacore_to_msv4_measure_type[
+                casacore_column_description["keywords"]["MEASINFO"]["type"]
+            ]["Ref"]
+        ] = casa_ref
+
+        if msv4_measure["type"] == "time":
+            msv4_measure["format"] = "unix"
+    return msv4_measure
 
 
 def calc_indx_for_row_split(tb_tool, taql_where):
@@ -74,11 +119,6 @@ def calc_indx_for_row_split(tb_tool, taql_where):
     # utimes = np.unique(tb_tool.getcol("TIME"))
 
     tvars = {}
-
-    #chunks = [len(utimes), len(baselines), freq_cnt, pol_cnt]
-
-    # print("nrows",  len(tb_tool.getcol("TIME")))
-
     tidxs = np.searchsorted(utimes, tb_tool.getcol("TIME"))
 
     ts_ant1, ts_ant2 = (
@@ -145,15 +185,16 @@ def read_col(
     return fulldata
 
 
-def create_attribute_metadata(col, tb_tool):
-    # Still a lot to do.
-    attrs_metadata = {}
+def create_attribute_metadata(col, main_column_descriptions):
+    attrs_metadata = column_description_casacore_to_msv4_measure(
+        main_column_descriptions[col]
+    )
+    # print('***',col,main_column_descriptions[col],msv4_measure,)
 
-    if col == "UVW":
-        # Should not be hardcoded
-        attrs_metadata["type"] = "uvw"
-        attrs_metadata["units"] = "m"
-        attrs_metadata["description"] = "uvw coordinates."
+    if col in ["DATA", "CORRECTED_DATA", "WEIGHT"]:
+        if not attrs_metadata:
+            attrs_metadata["type"] = "quanta"
+            attrs_metadata["units"] = ["unkown"]
 
     return attrs_metadata
 
@@ -178,7 +219,9 @@ def create_coordinates(
         "SPECTRAL_WINDOW",
         rename_ids=subt_rename_ids["SPECTRAL_WINDOW"],
     ).sel(spectral_window_id=spw_id)
-    coords["frequency"] = spw_xds["chan_freq"].data[~(np.isnan(spw_xds["chan_freq"].data))]
+    coords["frequency"] = spw_xds["chan_freq"].data[
+        ~(np.isnan(spw_xds["chan_freq"].data))
+    ]
 
     pol_xds = read_generic_table(
         infile,
@@ -192,44 +235,71 @@ def create_coordinates(
 
     xds = xds.assign_coords(coords)
 
+    ###### Create Frequency Coordinate ######
     # Add metadata to coordinates:
-    measures_freq_ref = spw_xds["meas_freq_ref"].data
-    xds.frequency.attrs["type"] = "spectral_coord"
-    xds.frequency.attrs["units"] = spw_xds.attrs["other"]["msv2"]["ctds_attrs"][
+    freq_column_description = spw_xds.attrs["other"]["msv2"]["ctds_attrs"][
         "column_descriptions"
-    ]["CHAN_FREQ"]["keywords"]["QuantumUnits"][0]
-    xds.frequency.attrs["velocity_frame"] = spw_xds.attrs["other"]["msv2"][
-        "ctds_attrs"
-    ]["column_descriptions"]["CHAN_FREQ"]["keywords"]["MEASINFO"]["TabRefTypes"][
-        measures_freq_ref
     ]
+
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        freq_column_description["CHAN_FREQ"], ref_code=spw_xds["meas_freq_ref"].data
+    )
+    xds.frequency.attrs.update(msv4_measure)
+
     xds.frequency.attrs["spectral_window_name"] = str(spw_xds.name.values)
-    xds.frequency.attrs["reference_frequency"] = float(spw_xds.ref_frequency.values)
-    xds.frequency.attrs["effective_channel_width"] = "EFFECTIVE_CHANNEL_WIDTH"
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        freq_column_description["REF_FREQUENCY"], ref_code=spw_xds["meas_freq_ref"].data
+    )
+    xds.frequency.attrs["reference_frequency"] = {
+        "dims": "",
+        "data": float(spw_xds.ref_frequency.values),
+        "attrs": msv4_measure,
+    }
+    xds.frequency.attrs["spw_id"] = spw_id
+
+    # xds.frequency.attrs["effective_channel_width"] = "EFFECTIVE_CHANNEL_WIDTH"
     # Add if doppler table is present
     # xds.frequency.attrs["doppler_velocity"] =
     # xds.frequency.attrs["doppler_type"] =
+    unique_chan_width = np.unique(
+        spw_xds.chan_width.data[np.logical_not(np.isnan(spw_xds.chan_width.data))]
+    )
+    # assert len(unique_chan_width) == 1, "Channel width varies for spw."
+    # xds.frequency.attrs["channel_width"] = spw_xds.chan_width.data[
+    #    ~(np.isnan(spw_xds.chan_width.data))
+    # ]  # unique_chan_width[0]
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        freq_column_description["CHAN_WIDTH"], ref_code=spw_xds["meas_freq_ref"].data
+    )
+    if not msv4_measure:
+        msv4_measure["type"] = "quanta"
+        msv4_measure["units"] = ["Hz"]
+    xds.frequency.attrs["channel_width"] = {
+        "dims": "",
+        "data": np.abs(unique_chan_width[0]),
+        "attrs": msv4_measure,
+    }  # Should always be increasing (ordering is fixed before saving).
 
-    #unique_chan_width = np.unique(spw_xds.chan_width.data[np.logical_not(np.isnan(spw_xds.chan_width.data))])
-    #print('unique_chan_width',unique_chan_width)
-    #print('spw_xds.chan_width.data',spw_xds.chan_width.data)
-    #assert len(unique_chan_width) == 1, "Channel width varies for spw."
-    xds.frequency.attrs["channel_width"] = spw_xds.chan_width.data[~(np.isnan(spw_xds.chan_width.data))]#unique_chan_width[0]
-
+    ###### Create Time Coordinate ######
     main_table_attrs = extract_table_attributes(infile)
-    xds.time.attrs["type"] = "time"
-    xds.time.attrs["units"] = main_table_attrs["column_descriptions"]["TIME"][
-        "keywords"
-    ]["QuantumUnits"][0]
-    xds.time.attrs["time_scale"] = main_table_attrs["column_descriptions"]["TIME"][
-        "keywords"
-    ]["MEASINFO"]["Ref"]
-    xds.time.attrs[
-        "format"
-    ] = "unix"  # Time gets converted to unix in xradio.vis._vis_utils._ms._tables.read.convert_casacore_time
-    xds.time.attrs["integration_time"] = interval
-    xds.time.attrs["effective_integration_time"] = "EFFECTIVE_INTEGRATION_TIME"
+    main_column_descriptions = main_table_attrs["column_descriptions"]
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        main_column_descriptions["TIME"]
+    )
+    xds.time.attrs.update(msv4_measure)
 
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        main_column_descriptions["INTERVAL"]
+    )
+    if not msv4_measure:
+        msv4_measure["type"] = "quanta"
+        msv4_measure["units"] = ["s"]
+    xds.time.attrs["integration_time"] = {
+        "dims": "",
+        "data": interval,
+        "attrs": msv4_measure,
+    }
+    xds.time.attrs["effective_integration_time"] = "EFFECTIVE_INTEGRATION_TIME"
     return xds
 
 
@@ -241,7 +311,7 @@ def convert_and_write_partition(
     state_ids=None,
     field_id: int = None,
     ignore_msv2_cols: Union[list, None] = None,
-    chunks_on_disk:  Union[Dict, None] = None,
+    chunks_on_disk: Union[Dict, None] = None,
     compressor: numcodecs.abc.Codec = numcodecs.Zstd(level=2),
     storage_backend="zarr",
     overwrite: bool = False,
@@ -269,6 +339,19 @@ def convert_and_write_partition(
     if field_id is not None:
         taql_where += f" AND (FIELD_ID = {field_id})"
         file_name = file_name + "_field_id_" + str(field_id)
+
+    ddi_xds = read_generic_table(infile, "DATA_DESCRIPTION").sel(row=ddi)
+    spw_id = ddi_xds.spectral_window_id.values
+
+    spw_xds = read_generic_table(
+        infile,
+        "SPECTRAL_WINDOW",
+        rename_ids=subt_rename_ids["SPECTRAL_WINDOW"],
+    ).sel(spectral_window_id=spw_id)
+    n_chan = len(spw_xds["chan_freq"].data[~(np.isnan(spw_xds["chan_freq"].data))])
+
+    main_table_attrs = extract_table_attributes(infile)
+    main_column_descriptions = main_table_attrs["column_descriptions"]
 
     start_with = time.time()
     with open_table_ro(infile) as mtable:
@@ -299,7 +382,7 @@ def convert_and_write_partition(
             start = time.time()
             xds = xr.Dataset()
             col_to_data_variable_names = {
-                "FLOAT_DATA" : "SPECTRUM",
+                "FLOAT_DATA": "SPECTRUM",
                 "DATA": "VISIBILITY",
                 "CORRECTED_DATA": "VISIBILITY_CORRECTED",
                 "WEIGHT_SPECTRUM": "WEIGHT",
@@ -313,7 +396,7 @@ def convert_and_write_partition(
                 "DATA": ("time", "baseline_id", "frequency", "polarization"),
                 "CORRECTED_DATA": ("time", "baseline_id", "frequency", "polarization"),
                 "WEIGHT_SPECTRUM": ("time", "baseline_id", "frequency", "polarization"),
-                "WEIGHT": ("time", "baseline_id", "polarization"),
+                "WEIGHT": ("time", "baseline_id", "frequency", "polarization"),
                 "FLAG": ("time", "baseline_id", "frequency", "polarization"),
                 "UVW": ("time", "baseline_id", "uvw_label"),
                 "TIME_CENTROID": ("time", "baseline_id"),
@@ -335,31 +418,50 @@ def convert_and_write_partition(
             col_names = tb_tool.colnames()
 
             # Create Data Variables
-            not_a_problem = True
             # logging.info("Setup xds "+ str(time.time()-start))
-
             for col in col_names:
                 if col in col_to_data_variable_names:
-                    if (col == "WEIGHT") and ("WEIGHT_SPECTRUM" not in col_names):
+                    if (col == "WEIGHT") and ("WEIGHT_SPECTRUM" in col_names):
                         continue
                     try:
                         start = time.time()
-                        xds[col_to_data_variable_names[col]] = xr.DataArray(
-                            read_col(
-                                tb_tool, col, time_baseline_shape, tidxs, bidxs, didxs
-                            ),
-                            dims=col_dims[col],
-                        )
-                        # logging.info("Time to read column " + str(col) + " : " + str(time.time()-start))
+                        if col == "WEIGHT":
+                            xds[col_to_data_variable_names[col]] = xr.DataArray(
+                                np.tile(
+                                    read_col(
+                                        tb_tool,
+                                        col,
+                                        time_baseline_shape,
+                                        tidxs,
+                                        bidxs,
+                                        didxs,
+                                    )[:, :, None, :],
+                                    (1, 1, n_chan, 1),
+                                ),
+                                dims=col_dims[col],
+                            )
+
+                        else:
+                            xds[col_to_data_variable_names[col]] = xr.DataArray(
+                                read_col(
+                                    tb_tool,
+                                    col,
+                                    time_baseline_shape,
+                                    tidxs,
+                                    bidxs,
+                                    didxs,
+                                ),
+                                dims=col_dims[col],
+                            )
+                            # logging.info("Time to read column " + str(col) + " : " + str(time.time()-start))
                     except:
                         # logging.debug("Could not load column",col)
                         continue
 
                     xds[col_to_data_variable_names[col]].attrs.update(
-                        create_attribute_metadata(col, tb_tool)
+                        create_attribute_metadata(col, main_column_descriptions)
                     )
 
-            field_id = _check_single_field(tb_tool)
             interval = _check_interval_consistent(tb_tool)
 
             start = time.time()
@@ -368,64 +470,163 @@ def convert_and_write_partition(
                 xds, infile, ddi, utime, interval, baseline_ant1_id, baseline_ant2_id
             )
 
-            field_xds = read_generic_table(
-                infile,
-                "FIELD",
-                rename_ids=subt_rename_ids["FIELD"],
-            )
+            field_id = _check_single_field(tb_tool)
+            xds = create_field_info(xds, infile, field_id)
 
-            field_info = {
-                "name": field_xds["name"].data[field_id],
-                "code": field_xds["code"].data[field_id],
-                "time": field_xds["time"].data[field_id],
-                "num_poly": 0,
-                "delay_dir": list(field_xds["delay_dir"].data[field_id, 0, :]),
-                "phase_dir": list(field_xds["phase_dir"].data[field_id, 0, :]),
-                "reference_dir": list(field_xds["reference_dir"].data[field_id, 0, :]),
+            xds.attrs["data_groups"] = {
+                "base": {
+                    "visibility": "VISIBILITY",
+                    "flag": "FLAG",
+                    "weight": "WEIGHT",
+                    "uvw": "UVW",
+                }
             }
-            xds.attrs["field_info"] = field_info
+
+            # Fix UVW frame
+            # From CASA fixvis docs: clean and the im tool ignore the reference frame claimed by the UVW column (it is often mislabelled as ITRF when it is really FK5 (J2000)) and instead assume the (u, v, w)s are in the same frame as the phase tracking center. calcuvw does not yet force the UVW column and field centers to use the same reference frame! Blank = use the phase tracking frame of vis.
+            xds.UVW.attrs["frame"] = xds.attrs["field_info"]["phase_direction"][
+                "attrs"
+            ]["frame"]
 
             if overwrite:
                 mode = "w"
             else:
                 mode = "w-"
-                
+
             add_encoding(xds, compressor=compressor, chunks=chunks_on_disk)
 
-            ant_xds = read_generic_table(
-                infile,
-                "ANTENNA",
-                rename_ids=subt_rename_ids["ANTENNA"],
-            )
-            del ant_xds.attrs["other"]
+            ant_xds = create_ant_xds(infile)
 
             xds.attrs["intent"] = intent
-            
-            #print("xxxx",xds["EFFECTIVE_INTEGRATION_TIME"].encoding,xds["FLAG"].encoding,chunks_on_disk)
-            #print(xds)
+            xds.attrs["ddi"] = ddi
+
+            # Time and frequency should always be increasing
+            if len(xds.frequency) > 1 and xds.frequency[1] - xds.frequency[0] < 0:
+                xds = xds.sel(frequency=slice(None, None, -1))
+
+            if len(xds.time) > 1 and xds.time[1] - xds.time[0] < 0:
+                xds = xds.sel(time=slice(None, None, -1))
 
             if storage_backend == "zarr":
                 xds.to_zarr(store=file_name + "/MAIN", mode=mode)
                 ant_xds.to_zarr(store=file_name + "/ANTENNA", mode=mode)
             elif storage_backend == "netcdf":
-                # xds.to_netcdf(path=file_name+"/MAIN", mode=mode)
-                print(ant_xds)
-                # ant_xds.offset.attrs["measure"] = [ant_xds.offset.attrs["measure"]]
-                # ant_xds.position.attrs["measure"] = [ant_xds.position.attrs["measure"]]
-                import os
+                # xds.to_netcdf(path=file_name+"/MAIN", mode=mode) #Does not work
+                raise
 
-                os.system(
-                    "mkdir /Users/jsteeb/Library/CloudStorage/Dropbox/xradio/doc/Antennae_North.cal.vis.zarr"
-                )
-                # os.system("mkdir " + file_name+"_ANTENNA")
-                ant_xds.to_netcdf(
-                    path=file_name + "_ANTENNA", mode=mode, engine="netcdf4"
-                )
-            # logging.info(" To disk time " + str(time.time()-start))
+    # logging.info("Saved ms_v4 " + file_name + " in " + str(time.time() - start_with) + "s")
 
-    logging.info(
-        "Saved ms_v4 " + file_name + " in " + str(time.time() - start_with) + "s"
+
+def create_ant_xds(infile):
+    to_new_data_variable_names = {
+        "position": "POSITION",
+        "offset": "FEED_OFFSET",
+        "dish_diameter": "DISH_DIAMETER",
+    }
+    ant_dims = {
+        "position": ["antenna_id", "coordinate"],
+        "offset": ["antenna_id", "coordinate"],
+        "dish_diameter": ["antenna_id"],
+    }
+    to_new_coord_names = {
+        "name": "name",
+        "station": "station",
+        "type": "type",
+        "mount": "mount",
+        "phased_array_id": "phased_array_id",
+    }
+
+    generic_ant_xds = read_generic_table(
+        infile,
+        "ANTENNA",
+        rename_ids=subt_rename_ids["ANTENNA"],
     )
+
+    ant_column_description = generic_ant_xds.attrs["other"]["msv2"]["ctds_attrs"][
+        "column_descriptions"
+    ]
+    # ['OFFSET', 'POSITION', 'TYPE', 'DISH_DIAMETER', 'FLAG_ROW', 'MOUNT', 'NAME', 'STATION']
+    ant_xds = xr.Dataset()
+
+    coords = {"antenna_id": np.arange(generic_ant_xds.dims["antenna_id"])}
+    for key in generic_ant_xds:
+        msv4_measure = column_description_casacore_to_msv4_measure(
+            ant_column_description[key.upper()]
+        )
+        if key in to_new_data_variable_names:
+            ant_xds[to_new_data_variable_names[key]] = xr.DataArray(
+                generic_ant_xds[key].data, dims=ant_dims[key]
+            )
+
+            if msv4_measure:
+                ant_xds[to_new_data_variable_names[key]].attrs.update(msv4_measure)
+
+            if key in ["dish_diameter"]:
+                ant_xds[to_new_data_variable_names[key]].attrs.update(
+                    {"units": ["m"], "type": "quanta"}
+                )
+
+        if key in to_new_coord_names:
+            coords[to_new_coord_names[key]] = ("antenna_id", generic_ant_xds[key].data)
+
+    ant_xds = ant_xds.assign_coords(coords)
+    return ant_xds
+
+
+def create_field_info(xds, infile, field_id):
+    field_xds = read_generic_table(
+        infile,
+        "FIELD",
+        rename_ids=subt_rename_ids["FIELD"],
+    ).sel(field_id=field_id)
+    # https://stackoverflow.com/questions/53195684/how-to-navigate-a-dict-by-list-of-keys
+
+    field_column_description = field_xds.attrs["other"]["msv2"]["ctds_attrs"][
+        "column_descriptions"
+    ]
+    # ['DELAY_DIR', 'PHASE_DIR', 'REFERENCE_DIR', 'CODE', 'FLAG_ROW', 'NAME', 'NUM_POLY', 'SOURCE_ID', 'TIME']
+
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        field_column_description["REFERENCE_DIR"],
+        ref_code=getattr(field_xds.get("refdir_ref"), "data", None)
+    )
+    delay_dir = {
+        "dims": "",
+        "data": list(field_xds["delay_dir"].data[0, :]),
+        "attrs": msv4_measure,
+    }
+
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        field_column_description["PHASE_DIR"],
+        ref_code=getattr(field_xds.get("phasedir_ref"), "data", None)
+    )
+    phase_dir = {
+        "dims": "",
+        "data": list(field_xds["phase_dir"].data[0, :]),
+        "attrs": msv4_measure,
+    }
+
+    msv4_measure = column_description_casacore_to_msv4_measure(
+        field_column_description["DELAY_DIR"],
+        ref_code=getattr(field_xds.get("delaydir_ref"), "data", None)
+    )
+    reference_dir = {
+        "dims": "",
+        "data": list(field_xds["delay_dir"].data[0, :]),
+        "attrs": msv4_measure,
+    }
+
+    field_info = {
+        "name": str(field_xds["name"].data),
+        "code": str(field_xds["code"].data),
+        "delay_direction": delay_dir,
+        "phase_direction": phase_dir,
+        "reference_direction": reference_dir,
+        "field_id": field_id,
+    }
+    xds.attrs["field_info"] = field_info
+
+    return xds
 
 
 def get_unqiue_intents(infile):
@@ -435,14 +636,16 @@ def get_unqiue_intents(infile):
         rename_ids=subt_rename_ids["STATE"],
     )
 
-    obs_mode_dict = {}
-    for i, obs_mode in enumerate(state_xds.obs_mode.values):
-        if obs_mode in obs_mode_dict:
-            obs_mode_dict[obs_mode].append(i)
-        else:
-            obs_mode_dict[obs_mode] = [i]
-
-    return list(obs_mode_dict.keys()), obs_mode_dict.values()
+    if len(state_xds.data_vars) > 0:
+        obs_mode_dict = {}
+        for i, obs_mode in enumerate(state_xds.obs_mode.values):
+            if obs_mode in obs_mode_dict:
+                obs_mode_dict[obs_mode].append(i)
+            else:
+                obs_mode_dict[obs_mode] = [i]
+        return list(obs_mode_dict.keys()), list(obs_mode_dict.values())
+    else:  # empty state table
+        return ["None"], [0]
 
 
 def enumerated_product(*args):
@@ -476,8 +679,13 @@ def convert_msv2_to_processing_set(
         field_ids = np.arange(read_generic_table(infile, "FIELD").dims["row"])
     elif partition_scheme == "ddi_state":
         state_xds = read_generic_table(infile, "STATE")
-        state_ids = np.arange(state_xds.dims["row"])
-        intents = state_xds.obs_mode.values
+
+        if len(state_xds.data_vars) > 0:
+            state_ids = [np.arange(state_xds.dims["row"])]
+            intents = state_xds.obs_mode.values
+        else:  # empty state table
+            state_ids = [0]
+            intents = ["None"]
         # print(state_xds, intents)
         # field_ids = [None]
         field_ids = np.arange(read_generic_table(infile, "FIELD").dims["row"])
